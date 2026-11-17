@@ -38,6 +38,7 @@ RUN apt-get update \
         tzdata \
         tini \
         libzbar0 \
+        libatomic1 \
     && playwright install --with-deps --no-shell chromium \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
