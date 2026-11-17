@@ -7,6 +7,11 @@ import src.ai_handler as ai_handler
 import src.config as app_config
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch):
+    monkeypatch.setenv("AI_RETRY_BASE_DELAY_SECONDS", "0")
+
+
 def _build_fake_client(responses_create_impl, chat_create_impl=None):
     responses = SimpleNamespace(create=responses_create_impl)
     chat = SimpleNamespace(
@@ -241,3 +246,90 @@ def test_get_ai_analysis_uses_first_json_object_when_model_returns_multiple_obje
 
     assert result["is_recommended"] is True
     assert result["reason"] == "first"
+
+
+def test_get_ai_analysis_escalates_output_budget_after_truncation_error(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS", "4000")
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS_CAP", "16000")
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        if len(request_history) <= 2:
+            raise Exception(
+                "Error code: 502 - {'error': {'type': 'structured_output_failed', 'code': "
+                "'structured_output_failed', 'message': 'structured output was incomplete "
+                "(finish_reason=length); increase the output budget'}}"
+            )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"prompt_version":"v1","is_recommended":true,'
+                            '"reason":"ok","risk_tags":[],"criteria_analysis":{"seller_type":"个人"}}'
+                        )
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
+    monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+
+    result = asyncio.run(
+        ai_handler.get_ai_analysis(
+            {"商品信息": {"商品ID": "9", "商品标题": "测试商品9"}},
+            image_paths=[],
+            prompt_text="请输出 JSON",
+        )
+    )
+
+    assert result["reason"] == "ok"
+    assert [item["max_tokens"] for item in request_history] == [4000, 8000, 16000]
+
+    captured = capsys.readouterr().out
+    assert "商品 #9 第 1/4 次尝试失败" in captured
+    assert "商品 #9 第 2/4 次尝试失败" in captured
+    assert "输出预算不足，下一次尝试将提高到 8000 tokens" in captured
+    assert "商品 #9 第 3/4 次尝试成功" in captured
+
+
+def test_attempt_counts_are_per_product_when_analyses_run_concurrently(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_MAX_ATTEMPTS", "3")
+
+    async def fake_create(**_kwargs):
+        raise Exception("Request timed out.")
+
+    monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
+    monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+
+    async def _run():
+        return await asyncio.gather(
+            ai_handler.get_ai_analysis(
+                {"商品信息": {"商品ID": "10", "商品标题": "测试商品10"}},
+                image_paths=[],
+                prompt_text="请输出 JSON",
+            ),
+            ai_handler.get_ai_analysis(
+                {"商品信息": {"商品ID": "11", "商品标题": "测试商品11"}},
+                image_paths=[],
+                prompt_text="请输出 JSON",
+            ),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(_run())
+
+    assert all(isinstance(result, Exception) for result in results)
+    captured = capsys.readouterr().out
+    for product_id in ("10", "11"):
+        for attempt in (1, 2, 3):
+            assert f"商品 #{product_id} 第 {attempt}/3 次尝试失败" in captured

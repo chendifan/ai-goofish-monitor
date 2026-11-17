@@ -48,6 +48,18 @@ class AISettings(_EnvSettings):
     enable_response_format: bool = _env_field(True, "ENABLE_RESPONSE_FORMAT")
     enable_thinking: bool = _env_field(False, "ENABLE_THINKING")
     skip_analysis: bool = _env_field(False, "SKIP_AI_ANALYSIS")
+    # 是否向网关发送 enable_thinking 参数，取值由 thinking_enabled 决定。
+    # 对默认开启思考的模型（Qwen3、DeepSeek-R1 等），思考过程会吃掉输出预算，
+    # 建议设为 true 并把 thinking_enabled 保持为 false。
+    thinking_enabled: bool = _env_field(False, "AI_THINKING_ENABLED")
+    request_timeout_seconds: float = _env_field(900.0, "AI_REQUEST_TIMEOUT_SECONDS", ge=1)
+    connect_timeout_seconds: float = _env_field(10.0, "AI_CONNECT_TIMEOUT_SECONDS", ge=1)
+    sdk_max_retries: int = _env_field(0, "AI_SDK_MAX_RETRIES", ge=0)
+    max_attempts: int = _env_field(4, "AI_MAX_ATTEMPTS", ge=1)
+    max_output_tokens: int = _env_field(10240, "AI_MAX_OUTPUT_TOKENS", ge=1)
+    max_output_tokens_cap: int = _env_field(32000, "AI_MAX_OUTPUT_TOKENS_CAP", ge=1)
+    retry_base_delay_seconds: float = _env_field(3.0, "AI_RETRY_BASE_DELAY_SECONDS", ge=0)
+    retry_delay_cap_seconds: float = _env_field(30.0, "AI_RETRY_DELAY_CAP_SECONDS", ge=1)
 
     def is_configured(self) -> bool:
         """检查AI是否已正确配置"""

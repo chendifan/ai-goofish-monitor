@@ -2,11 +2,43 @@
 AI 响应解析工具
 """
 import json
-from typing import Any
+from typing import Any, Optional
 
 
 class EmptyAIResponseError(ValueError):
     """AI 返回了空内容。"""
+
+
+class TruncatedAIResponseError(ValueError):
+    """AI 响应被截断（输出预算不足，常见于思考过程占满输出长度）。"""
+
+
+TRUNCATION_REASONS = {"length", "max_output_tokens", "incomplete"}
+
+
+def get_finish_reason(response: Any) -> Optional[str]:
+    """返回响应的结束原因，Chat Completions 与 Responses 两种形态都支持。"""
+    choices = getattr(response, "choices", None)
+    if choices:
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason:
+            return str(finish_reason)
+
+    status = getattr(response, "status", None)
+    if status and str(status) != "completed":
+        details = getattr(response, "incomplete_details", None)
+        return str(getattr(details, "reason", None) or status)
+
+    return None
+
+
+def ensure_response_is_complete(response: Any) -> None:
+    """响应被截断时抛出可重试的截断错误。"""
+    finish_reason = get_finish_reason(response)
+    if finish_reason in TRUNCATION_REASONS:
+        raise TruncatedAIResponseError(
+            f"AI响应被截断（finish_reason={finish_reason}），输出预算不足。"
+        )
 
 
 def extract_ai_response_content(response: Any) -> str:

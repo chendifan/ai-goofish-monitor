@@ -1,9 +1,12 @@
 import os
 import sys
 
+import httpx
+
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+from src.infrastructure.config.settings import AISettings
 from src.infrastructure.external.ai_client import _sanitize_no_proxy_env
 
 # --- AI & Notification Configuration ---
@@ -49,6 +52,13 @@ SKIP_AI_ANALYSIS = os.getenv("SKIP_AI_ANALYSIS", "false").lower() == "true"
 ENABLE_THINKING = os.getenv("ENABLE_THINKING", "false").lower() == "true"
 ENABLE_RESPONSE_FORMAT = os.getenv("ENABLE_RESPONSE_FORMAT", "true").lower() == "true"
 
+# AI 调用参数：超时、重试与输出预算（应用层是唯一重试主体，SDK 内部重试设为 0）。
+ai_settings = AISettings()
+AI_THINKING_ENABLED = ai_settings.thinking_enabled
+AI_REQUEST_TIMEOUT_SECONDS = ai_settings.request_timeout_seconds
+AI_CONNECT_TIMEOUT_SECONDS = ai_settings.connect_timeout_seconds
+AI_SDK_MAX_RETRIES = ai_settings.sdk_max_retries
+
 # --- Headers ---
 IMAGE_DOWNLOAD_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0',
@@ -74,7 +84,12 @@ else:
             os.environ['HTTPS_PROXY'] = PROXY_URL
 
         # openai 客户端内部的 httpx 会自动从环境变量中获取代理配置
-        client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
+        client = AsyncOpenAI(
+            api_key=API_KEY,
+            base_url=BASE_URL,
+            timeout=httpx.Timeout(AI_REQUEST_TIMEOUT_SECONDS, connect=AI_CONNECT_TIMEOUT_SECONDS),
+            max_retries=AI_SDK_MAX_RETRIES,
+        )
     except Exception as e:
         print(f"初始化 OpenAI 客户端时出错: {e}")
         client = None
@@ -95,7 +110,7 @@ def get_ai_request_params(**kwargs):
     构建AI请求参数，根据ENABLE_THINKING和ENABLE_RESPONSE_FORMAT环境变量决定是否添加相应参数
     """
     if ENABLE_THINKING:
-        kwargs["extra_body"] = {"enable_thinking": False}
+        kwargs["extra_body"] = {"enable_thinking": AI_THINKING_ENABLED}
     
     # 如果禁用结构化输出，则移除 text.format 配置
     if not ENABLE_RESPONSE_FORMAT and "text" in kwargs:

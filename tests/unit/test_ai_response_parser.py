@@ -1,10 +1,38 @@
 import pytest
+from types import SimpleNamespace
 
 from src.services.ai_response_parser import (
+    TruncatedAIResponseError,
+    ensure_response_is_complete,
+    get_finish_reason,
     extract_ai_response_content,
     parse_ai_response_json,
     EmptyAIResponseError,
 )
+
+
+def test_get_finish_reason_reads_chat_completions_choice():
+    response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="length")])
+    assert get_finish_reason(response) == "length"
+
+
+def test_get_finish_reason_reads_responses_api_incomplete_details():
+    response = SimpleNamespace(
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
+    assert get_finish_reason(response) == "max_output_tokens"
+
+
+def test_ensure_response_is_complete_allows_normal_finish():
+    response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop")])
+    ensure_response_is_complete(response)
+
+
+def test_ensure_response_is_complete_raises_on_truncated_output():
+    response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="length")])
+    with pytest.raises(TruncatedAIResponseError, match="输出预算不足"):
+        ensure_response_is_complete(response)
 
 
 def test_parse_ai_response_json_uses_first_object_when_multiple_json_objects_are_concatenated():

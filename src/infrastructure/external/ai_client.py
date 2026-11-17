@@ -2,6 +2,7 @@
 AI 客户端封装
 提供统一的 AI 调用接口
 """
+import asyncio
 import ipaddress
 import os
 import json
@@ -9,6 +10,7 @@ import base64
 from typing import Dict, List, Optional
 from datetime import datetime
 from dotenv import load_dotenv
+import httpx
 from openai import AsyncOpenAI
 from src.ai_message_builder import (
     build_analysis_text_prompt,
@@ -19,18 +21,27 @@ from src.infrastructure.config.env_manager import env_manager
 from src.services.ai_request_compat import (
     CHAT_COMPLETIONS_API_MODE,
     RESPONSES_API_MODE,
+    add_thinking_extra_body,
     build_ai_request_params,
     create_ai_response_async,
     is_chat_completions_api_unsupported_error,
     is_json_output_unsupported_error,
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
+    is_thinking_unsupported_error,
     remove_temperature_param,
 )
 from src.services.ai_response_parser import (
     EmptyAIResponseError,
+    ensure_response_is_complete,
     extract_ai_response_content,
     parse_ai_response_json,
+)
+from src.services.ai_retry_policy import (
+    AIRetryPolicy,
+    format_retry_note,
+    is_output_budget_error,
+    is_transient_error,
 )
 
 
@@ -114,7 +125,13 @@ class AIClient:
 
             return AsyncOpenAI(
                 api_key=self.settings.api_key,
-                base_url=self.settings.base_url
+                base_url=self.settings.base_url,
+                timeout=httpx.Timeout(
+                    self.settings.request_timeout_seconds,
+                    connect=self.settings.connect_timeout_seconds,
+                ),
+                # SDK 内部重试会让日志里的尝试次数失真，重试统一由应用层负责。
+                max_retries=self.settings.sdk_max_retries,
             )
         except Exception as e:
             print(f"初始化 AI 客户端失败: {e}")
@@ -171,7 +188,9 @@ class AIClient:
 
         try:
             messages = self._build_messages(product_data, image_paths, prompt_text)
-            response = await self._call_ai(messages)
+            item_info = product_data.get("商品信息", {}) or {}
+            log_label = f"[AI分析] 商品 #{item_info.get('商品ID', 'N/A')}"
+            response = await self._call_ai(messages, log_label=log_label)
             return self._parse_response(response)
         except Exception as e:
             print(f"AI 分析失败: {e}")
@@ -199,33 +218,41 @@ class AIClient:
         messages: List[Dict],
         *,
         temperature: float = 0.1,
-        max_output_tokens: int = 4000,
+        max_output_tokens: Optional[int] = None,
         enable_json_output: Optional[bool] = None,
+        log_label: str = "",
     ) -> str:
-        """调用 AI API"""
+        """调用 AI API（应用层统一负责尝试计数、退避与输出预算递增）"""
+        settings = self.settings
+        policy = AIRetryPolicy.from_settings(settings)
         api_mode = CHAT_COMPLETIONS_API_MODE
         use_response_format = (
-            self.settings.enable_response_format
+            settings.enable_response_format
             if enable_json_output is None
             else enable_json_output
         )
         use_temperature = True
-        max_attempts = 4
+        use_thinking_param = settings.enable_thinking
+        output_tokens = int(max_output_tokens or policy.base_output_tokens)
+        prefix = f"{log_label} " if log_label else ""
 
-        for attempt in range(max_attempts):
+        for attempt in policy.attempts():
             request_params = build_ai_request_params(
                 api_mode,
-                model=self.settings.model_name,
+                model=settings.model_name,
                 messages=messages,
                 temperature=temperature,
-                max_output_tokens=max_output_tokens,
+                max_output_tokens=output_tokens,
                 enable_json_output=use_response_format,
             )
             if not use_temperature:
                 request_params = remove_temperature_param(request_params)
-
-            if self.settings.enable_thinking:
-                request_params["extra_body"] = {"enable_thinking": False}
+            if use_thinking_param:
+                request_params = add_thinking_extra_body(
+                    request_params,
+                    settings.thinking_enabled,
+                    send_param=True,
+                )
 
             try:
                 response = await create_ai_response_async(
@@ -233,41 +260,53 @@ class AIClient:
                     api_mode,
                     request_params,
                 )
+                ensure_response_is_complete(response)
                 return extract_ai_response_content(response)
-            except EmptyAIResponseError as exc:
-                if attempt < max_attempts - 1:
-                    print(
-                        f"AI响应为空，正在自动重试 ({attempt + 2}/{max_attempts})"
-                    )
-                    continue
-                raise exc
             except Exception as exc:
-                changed = False
+                retryable = isinstance(exc, EmptyAIResponseError)
                 if (
                     api_mode == CHAT_COMPLETIONS_API_MODE
                     and is_chat_completions_api_unsupported_error(exc)
                 ):
                     api_mode = RESPONSES_API_MODE
-                    changed = True
+                    retryable = True
                     print("当前服务未实现 Chat Completions API，正在自动回退到 Responses API")
                 elif (
                     api_mode == RESPONSES_API_MODE
                     and is_responses_api_unsupported_error(exc)
                 ):
                     api_mode = CHAT_COMPLETIONS_API_MODE
-                    changed = True
+                    retryable = True
                     print("当前服务未实现 Responses API，正在自动回退到 Chat Completions API")
                 if use_response_format and is_json_output_unsupported_error(exc):
                     use_response_format = False
-                    changed = True
+                    retryable = True
                     print("当前模型不支持结构化 JSON 输出，正在自动重试并移除该参数")
                 if use_temperature and is_temperature_unsupported_error(exc):
                     use_temperature = False
-                    changed = True
+                    retryable = True
                     print("当前模型不支持 temperature 参数，正在自动重试并移除该参数")
-                if changed and attempt < max_attempts - 1:
-                    continue
-                raise
+                if use_thinking_param and is_thinking_unsupported_error(exc):
+                    use_thinking_param = False
+                    retryable = True
+                    print("当前模型不支持 enable_thinking 参数，正在自动回退并移除该参数")
+                if is_output_budget_error(exc):
+                    retryable = True
+                    escalated_tokens = policy.escalate_output_tokens(output_tokens)
+                    if escalated_tokens > output_tokens:
+                        output_tokens = escalated_tokens
+                        print(f"{prefix}输出预算不足，下一次尝试将提高到 {output_tokens} tokens")
+                if is_transient_error(exc):
+                    retryable = True
+
+                print(f"{prefix}{policy.describe_attempt(attempt)}失败: {exc}")
+                if not retryable or not policy.has_next_attempt(attempt):
+                    raise
+
+                delay = policy.delay_seconds(attempt, exc)
+                print(f"{prefix}{format_retry_note(policy, attempt, delay)}")
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
         raise RuntimeError("AI 调用在兼容性重试后仍未返回结果")
 

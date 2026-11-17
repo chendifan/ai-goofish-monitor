@@ -24,6 +24,7 @@ from src.config import (
     TASK_IMAGE_DIR_PREFIX,
     MODEL_NAME,
     ENABLE_RESPONSE_FORMAT,
+    ENABLE_THINKING,
     client,
 )
 from src.ai_message_builder import (
@@ -31,7 +32,7 @@ from src.ai_message_builder import (
     build_user_message_content,
 )
 from src.services.ai_response_parser import (
-    EmptyAIResponseError,
+    ensure_response_is_complete,
     extract_ai_response_content,
     parse_ai_response_json,
 )
@@ -44,9 +45,16 @@ from src.services.ai_request_compat import (
     is_json_output_unsupported_error,
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
+    is_thinking_unsupported_error,
     remove_temperature_param,
+    remove_thinking_param,
 )
 from src.services.notification_service import build_notification_service
+from src.services.ai_retry_policy import (
+    AIRetryPolicy,
+    format_retry_note,
+    is_output_budget_error,
+)
 from src.utils import convert_goofish_link, retry_on_failure
 
 
@@ -368,15 +376,19 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
     except Exception as e:
         safe_print(f"   [日志] 保存AI分析日志时出错: {e}")
 
-    # 增强的AI调用，包含更严格的结构化输出控制和重试机制
-    max_retries = 4
+    # AI 调用：应用层统一负责尝试计数、退避节奏与输出预算递增
+    policy = AIRetryPolicy.from_settings()
+    log_scope = f"[AI分析] 商品 #{product_id}"
     api_mode = CHAT_COMPLETIONS_API_MODE
     use_response_format = ENABLE_RESPONSE_FORMAT
     use_temperature = True
-    for attempt in range(max_retries):
+    use_thinking_param = ENABLE_THINKING
+    max_output_tokens = policy.base_output_tokens
+
+    for attempt in policy.attempts():
         try:
             # 根据重试次数调整参数
-            current_temperature = 0.1 if attempt == 0 else 0.05  # 重试时使用更低的温度
+            current_temperature = 0.1 if attempt == 1 else 0.05  # 重试时使用更低的温度
 
             from src.config import get_ai_request_params
 
@@ -385,16 +397,18 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
                 model=MODEL_NAME,
                 messages=messages,
                 temperature=current_temperature,
-                max_output_tokens=4000,
+                max_output_tokens=max_output_tokens,
                 enable_json_output=use_response_format,
             )
             if not use_temperature:
                 request_params = remove_temperature_param(request_params)
 
             request_params = get_ai_request_params(**request_params)
+            if not use_thinking_param:
+                request_params = remove_thinking_param(request_params)
 
             if AI_DEBUG_MODE:
-                safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 REQUEST ---")
+                safe_print(f"\n--- [AI DEBUG] {log_scope} 第{attempt}次尝试 REQUEST ---")
                 safe_print(
                     json.dumps(
                         _build_debug_request_summary(api_mode, request_params),
@@ -409,38 +423,21 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
                 api_mode,
                 request_params,
             )
+            ensure_response_is_complete(response)
             ai_response_content = extract_ai_response_content(response)
 
             if AI_DEBUG_MODE:
-                safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 ---")
+                safe_print(f"\n--- [AI DEBUG] {log_scope} 第{attempt}次尝试 ---")
                 safe_print("--- RAW AI RESPONSE ---")
                 safe_print(ai_response_content)
                 safe_print("---------------------\n")
 
-            try:
-                parsed_response = parse_ai_response_json(ai_response_content)
-
-                # 验证响应格式
-                if validate_ai_response_format(parsed_response):
-                    safe_print(f"   [AI分析] 第{attempt + 1}次尝试成功，响应格式验证通过")
-                    return parsed_response
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试格式验证失败")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
-                    continue
+            parsed_response = parse_ai_response_json(ai_response_content)
+            if not validate_ai_response_format(parsed_response):
                 raise ValueError("AI响应格式缺少必需字段或字段类型不正确。")
-            except json.JSONDecodeError as e:
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试JSON解析失败: {e}")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
-                    continue
-                raise e
-            except EmptyAIResponseError as e:
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试返回空响应: {e}")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
-                    continue
-                raise e
+
+            safe_print(f"   {log_scope} {policy.describe_attempt(attempt)}成功，响应格式验证通过")
+            return parsed_response
 
         except Exception as e:
             if (
@@ -466,14 +463,29 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
                 safe_print(
                     "   [AI分析] 当前模型不支持 temperature 参数，后续重试将自动禁用该参数。"
                 )
+            if use_thinking_param and is_thinking_unsupported_error(e):
+                use_thinking_param = False
+                safe_print(
+                    "   [AI分析] 当前模型不支持 enable_thinking 参数，后续重试将自动移除该参数。"
+                )
+            if is_output_budget_error(e) and max_output_tokens < policy.output_token_cap:
+                escalated_tokens = policy.escalate_output_tokens(max_output_tokens)
+                if escalated_tokens > max_output_tokens:
+                    max_output_tokens = escalated_tokens
+                    safe_print(
+                        f"   {log_scope} 输出预算不足，下一次尝试将提高到 {max_output_tokens} tokens"
+                    )
+
             if AI_DEBUG_MODE:
-                safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 EXCEPTION ---")
+                safe_print(f"\n--- [AI DEBUG] {log_scope} 第{attempt}次尝试 EXCEPTION ---")
                 safe_print(repr(e))
                 safe_print(traceback.format_exc())
                 safe_print("-------------------------------------\n")
-            safe_print(f"   [AI分析] 第{attempt + 1}次尝试AI调用失败: {e}")
-            if attempt < max_retries - 1:
-                safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
-                continue
-            else:
-                raise e
+            safe_print(f"   {log_scope} {policy.describe_attempt(attempt)}失败: {e}")
+            if not policy.has_next_attempt(attempt):
+                raise
+
+            delay = policy.delay_seconds(attempt, e)
+            safe_print(f"   {log_scope} {format_retry_note(policy, attempt, delay)}")
+            if delay > 0:
+                await asyncio.sleep(delay)

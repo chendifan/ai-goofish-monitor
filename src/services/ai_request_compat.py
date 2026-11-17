@@ -33,6 +33,27 @@ UNSUPPORTED_TEMPERATURE_MARKERS = (
     "temperature",
     "sampling temperature",
 )
+UNSUPPORTED_THINKING_MARKERS = (
+    "enable_thinking",
+    "thinking",
+    "reasoning",
+)
+
+
+def add_thinking_extra_body(
+    request_params: Dict[str, Any],
+    enabled: bool,
+    send_param: bool = False,
+) -> Dict[str, Any]:
+    """按需附加 enable_thinking 参数（部分网关需要显式声明）。"""
+    next_params = dict(request_params)
+    if not send_param:
+        return next_params
+
+    extra_body = dict(next_params.get("extra_body") or {})
+    extra_body["enable_thinking"] = bool(enabled)
+    next_params["extra_body"] = extra_body
+    return next_params
 
 
 def build_responses_input(messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -172,6 +193,38 @@ def remove_temperature_param(request_params: Dict[str, Any]) -> Dict[str, Any]:
     """移除 temperature 参数，适配不支持采样温度的模型网关。"""
     next_params = dict(request_params)
     next_params.pop("temperature", None)
+    return next_params
+
+
+def is_thinking_unsupported_error(error: Exception) -> bool:
+    """识别模型或网关不支持 enable_thinking 参数的错误。"""
+    body = getattr(error, "body", None)
+    if isinstance(body, dict) and body.get("param") in (
+        "enable_thinking",
+        "extra_body.enable_thinking",
+    ):
+        return True
+
+    message = str(error).lower()
+    return (
+        "not supported" in message
+        or "unsupported" in message
+        or "invalid" in message
+        or "参数错误" in message
+    ) and any(marker in message for marker in UNSUPPORTED_THINKING_MARKERS)
+
+
+def remove_thinking_param(request_params: Dict[str, Any]) -> Dict[str, Any]:
+    """移除 enable_thinking 参数，适配不支持思考开关的模型网关。"""
+    next_params = dict(request_params)
+    extra_body = next_params.get("extra_body")
+    if isinstance(extra_body, dict):
+        cleaned = dict(extra_body)
+        cleaned.pop("enable_thinking", None)
+        if cleaned:
+            next_params["extra_body"] = cleaned
+        else:
+            del next_params["extra_body"]
     return next_params
 
 

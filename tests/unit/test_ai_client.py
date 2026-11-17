@@ -11,6 +11,22 @@ from src.infrastructure.external.ai_client import AIClient, _sanitize_no_proxy_e
 from src.services.ai_request_compat import build_responses_input
 
 
+def _fake_settings(**overrides):
+    settings = {
+        "model_name": "fake-model",
+        "enable_response_format": True,
+        "enable_thinking": False,
+        "thinking_enabled": False,
+        "max_attempts": 4,
+        "max_output_tokens": 10240,
+        "max_output_tokens_cap": 32000,
+        "retry_base_delay_seconds": 0.0,
+        "retry_delay_cap_seconds": 30.0,
+    }
+    settings.update(overrides)
+    return SimpleNamespace(**settings)
+
+
 def _build_fake_client(responses_create_impl, chat_create_impl=None):
     responses = SimpleNamespace(create=responses_create_impl)
     chat = SimpleNamespace(
@@ -80,11 +96,7 @@ def test_build_responses_input_converts_multimodal_messages():
 
 def test_call_ai_retries_without_structured_output_when_model_rejects_it():
     client = AIClient.__new__(AIClient)
-    client.settings = SimpleNamespace(
-        model_name="fake-model",
-        enable_response_format=True,
-        enable_thinking=False,
-    )
+    client.settings = _fake_settings(enable_response_format=True)
     request_history = []
 
     async def fake_create(**kwargs):
@@ -116,11 +128,7 @@ def test_call_ai_retries_without_structured_output_when_model_rejects_it():
 
 def test_call_ai_falls_back_to_responses_when_chat_completions_api_is_missing():
     client = AIClient.__new__(AIClient)
-    client.settings = SimpleNamespace(
-        model_name="fake-model",
-        enable_response_format=True,
-        enable_thinking=False,
-    )
+    client.settings = _fake_settings(enable_response_format=True)
     request_history = []
 
     async def fake_chat_create(**kwargs):
@@ -152,11 +160,7 @@ def test_call_ai_falls_back_to_responses_when_chat_completions_api_is_missing():
 
 def test_call_ai_retries_without_temperature_when_gateway_rejects_it():
     client = AIClient.__new__(AIClient)
-    client.settings = SimpleNamespace(
-        model_name="fake-model",
-        enable_response_format=False,
-        enable_thinking=False,
-    )
+    client.settings = _fake_settings(enable_response_format=False)
     request_history = []
 
     async def fake_create(**kwargs):
@@ -182,11 +186,7 @@ def test_call_ai_retries_without_temperature_when_gateway_rejects_it():
 
 def test_call_ai_retries_when_response_content_is_empty():
     client = AIClient.__new__(AIClient)
-    client.settings = SimpleNamespace(
-        model_name="fake-model",
-        enable_response_format=False,
-        enable_thinking=False,
-    )
+    client.settings = _fake_settings(enable_response_format=False)
     request_history = []
 
     async def fake_create(**kwargs):
@@ -205,11 +205,7 @@ def test_call_ai_retries_when_response_content_is_empty():
 
 def test_call_ai_raises_after_all_empty_response_retries_are_exhausted():
     client = AIClient.__new__(AIClient)
-    client.settings = SimpleNamespace(
-        model_name="fake-model",
-        enable_response_format=False,
-        enable_thinking=False,
-    )
+    client.settings = _fake_settings(enable_response_format=False)
     request_history = []
 
     async def fake_create(**kwargs):
@@ -337,3 +333,121 @@ def test_legacy_config_client_initializes_with_bracketed_no_proxy(tmp_path):
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+def test_call_ai_escalates_output_budget_after_truncation_error():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings(
+        max_output_tokens=4000,
+        max_output_tokens_cap=16000,
+    )
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        if len(request_history) < 3:
+            raise Exception(
+                "Error code: 502 - {'error': {'type': 'structured_output_failed', 'code': "
+                "'structured_output_failed', 'message': 'structured output was incomplete "
+                "(finish_reason=length); increase the output budget'}}"
+            )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"ok":true}'),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    client.client = _build_fake_client(fake_create)
+
+    response = asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert response == '{"ok":true}'
+    assert [item["max_tokens"] for item in request_history] == [4000, 8000, 16000]
+
+
+def test_call_ai_retries_truncated_response_before_parsing():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings(
+        max_attempts=2,
+        max_output_tokens=4000,
+        max_output_tokens_cap=8000,
+    )
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        content = '{"partial": true' if len(request_history) == 1 else '{"ok":true}'
+        finish_reason = "length" if len(request_history) == 1 else "stop"
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+    client.client = _build_fake_client(fake_create)
+
+    response = asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert response == '{"ok":true}'
+    assert len(request_history) == 2
+    assert request_history[0]["max_tokens"] == 4000
+    assert request_history[1]["max_tokens"] == 8000
+
+
+def test_call_ai_retries_transient_timeout_error():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings()
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        if len(request_history) == 1:
+            raise Exception("Request timed out.")
+        return SimpleNamespace(output_text='{"ok":true}')
+
+    client.client = _build_fake_client(fake_create)
+
+    response = asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert response == '{"ok":true}'
+    assert len(request_history) == 2
+
+
+def test_call_ai_sends_enable_thinking_with_configured_value_and_falls_back():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings(enable_thinking=True, thinking_enabled=False)
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        if len(request_history) == 1:
+            raise Exception("enable_thinking is not supported by this gateway")
+        return SimpleNamespace(output_text='{"ok":true}')
+
+    client.client = _build_fake_client(fake_create)
+
+    response = asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert response == '{"ok":true}'
+    assert request_history[0]["extra_body"]["enable_thinking"] is False
+    assert "extra_body" not in request_history[1]
+
+
+def test_call_ai_omits_thinking_param_when_the_gate_is_closed():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings()
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        return SimpleNamespace(output_text='{"ok":true}')
+
+    client.client = _build_fake_client(fake_create)
+
+    asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert "extra_body" not in request_history[0]
