@@ -18,7 +18,7 @@ def _fake_settings(**overrides):
         "enable_thinking": False,
         "thinking_enabled": False,
         "max_attempts": 4,
-        "max_output_tokens": 10240,
+        "max_output_tokens": 20480,
         "max_output_tokens_cap": 32000,
         "retry_base_delay_seconds": 0.0,
         "retry_delay_cap_seconds": 30.0,

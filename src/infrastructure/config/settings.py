@@ -56,7 +56,7 @@ class AISettings(_EnvSettings):
     connect_timeout_seconds: float = _env_field(10.0, "AI_CONNECT_TIMEOUT_SECONDS", ge=1)
     sdk_max_retries: int = _env_field(0, "AI_SDK_MAX_RETRIES", ge=0)
     max_attempts: int = _env_field(4, "AI_MAX_ATTEMPTS", ge=1)
-    max_output_tokens: int = _env_field(10240, "AI_MAX_OUTPUT_TOKENS", ge=1)
+    max_output_tokens: int = _env_field(20480, "AI_MAX_OUTPUT_TOKENS", ge=1)
     max_output_tokens_cap: int = _env_field(32000, "AI_MAX_OUTPUT_TOKENS_CAP", ge=1)
     retry_base_delay_seconds: float = _env_field(3.0, "AI_RETRY_BASE_DELAY_SECONDS", ge=0)
     retry_delay_cap_seconds: float = _env_field(30.0, "AI_RETRY_DELAY_CAP_SECONDS", ge=1)

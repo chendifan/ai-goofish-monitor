@@ -89,7 +89,7 @@ class AIRetryPolicy:
     """AI 调用重试策略（应用层是唯一重试主体，SDK 内部重试应设为 0）。"""
 
     max_attempts: int = 4
-    base_output_tokens: int = 10240
+    base_output_tokens: int = 20480
     output_token_cap: int = 32000
     base_delay_seconds: float = 3.0
     delay_cap_seconds: float = 30.0
