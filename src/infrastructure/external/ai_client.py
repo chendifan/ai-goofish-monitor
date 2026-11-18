@@ -21,7 +21,7 @@ from src.infrastructure.config.env_manager import env_manager
 from src.services.ai_request_compat import (
     CHAT_COMPLETIONS_API_MODE,
     RESPONSES_API_MODE,
-    add_thinking_extra_body,
+    add_reasoning_control,
     build_ai_request_params,
     create_ai_response_async,
     is_chat_completions_api_unsupported_error,
@@ -29,6 +29,7 @@ from src.services.ai_request_compat import (
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
     is_thinking_unsupported_error,
+    normalize_thinking_param_style,
     remove_temperature_param,
 )
 from src.services.ai_response_parser import (
@@ -233,6 +234,9 @@ class AIClient:
         )
         use_temperature = True
         use_thinking_param = settings.enable_thinking
+        thinking_param_style = normalize_thinking_param_style(settings.thinking_param_style)
+        reasoning_effort = str(settings.reasoning_effort or "").strip()
+        use_reasoning_control = use_thinking_param or bool(reasoning_effort)
         output_tokens = int(max_output_tokens or policy.base_output_tokens)
         prefix = f"{log_label} " if log_label else ""
 
@@ -247,13 +251,14 @@ class AIClient:
             )
             if not use_temperature:
                 request_params = remove_temperature_param(request_params)
-            if use_thinking_param:
-                request_params = add_thinking_extra_body(
+            if use_reasoning_control:
+                request_params = add_reasoning_control(
                     request_params,
-                    settings.thinking_enabled,
-                    send_param=True,
+                    api_mode,
+                    style=thinking_param_style,
+                    enabled=settings.thinking_enabled if use_thinking_param else None,
+                    effort=reasoning_effort or None,
                 )
-
             try:
                 response = await create_ai_response_async(
                     self.client,
@@ -286,10 +291,10 @@ class AIClient:
                     use_temperature = False
                     retryable = True
                     print("当前模型不支持 temperature 参数，正在自动重试并移除该参数")
-                if use_thinking_param and is_thinking_unsupported_error(exc):
-                    use_thinking_param = False
+                if use_reasoning_control and is_thinking_unsupported_error(exc):
+                    use_reasoning_control = False
                     retryable = True
-                    print("当前模型不支持 enable_thinking 参数，正在自动回退并移除该参数")
+                    print("当前模型不支持思考控制参数，正在自动重试并移除该参数")
                 if is_output_budget_error(exc):
                     retryable = True
                     escalated_tokens = policy.escalate_output_tokens(output_tokens)

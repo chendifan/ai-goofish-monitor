@@ -52,6 +52,11 @@ class AISettings(_EnvSettings):
     # 对默认开启思考的模型（Qwen3、DeepSeek-R1 等），思考过程会吃掉输出预算，
     # 建议设为 true 并把 thinking_enabled 保持为 false。
     thinking_enabled: bool = _env_field(False, "AI_THINKING_ENABLED")
+    # 思考开关的参数形态：网关只认其中一种时，另一种写法会被静默忽略。
+    # extra_body 是中转站的常见写法；vLLM 部署的 Qwen3 通常只认 chat_template_kwargs。
+    thinking_param_style: str = _env_field("extra_body", "AI_THINKING_PARAM_STYLE")
+    # 可选推理强度（minimal/low/medium/high）。部分网关不接受思考开关，只接受推理强度。
+    reasoning_effort: str = _env_field("", "AI_REASONING_EFFORT")
     request_timeout_seconds: float = _env_field(900.0, "AI_REQUEST_TIMEOUT_SECONDS", ge=1)
     connect_timeout_seconds: float = _env_field(10.0, "AI_CONNECT_TIMEOUT_SECONDS", ge=1)
     sdk_max_retries: int = _env_field(0, "AI_SDK_MAX_RETRIES", ge=0)

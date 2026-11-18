@@ -1,7 +1,7 @@
 """AI 请求兼容性辅助逻辑。"""
 
 import copy
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 
 RESPONSES_API_MODE = "responses"
@@ -35,24 +35,76 @@ UNSUPPORTED_TEMPERATURE_MARKERS = (
 )
 UNSUPPORTED_THINKING_MARKERS = (
     "enable_thinking",
+    "chat_template_kwargs",
+    "reasoning_effort",
     "thinking",
     "reasoning",
 )
+REASONING_CONTROL_PARAM_NAMES = (
+    "enable_thinking",
+    "extra_body.enable_thinking",
+    "chat_template_kwargs",
+    "extra_body.chat_template_kwargs",
+    "reasoning_effort",
+    "extra_body.reasoning_effort",
+    "reasoning",
+)
+THINKING_PARAM_STYLE_EXTRA_BODY = "extra_body"
+THINKING_PARAM_STYLE_CHAT_TEMPLATE_KWARGS = "chat_template_kwargs"
+THINKING_PARAM_STYLES = (
+    THINKING_PARAM_STYLE_EXTRA_BODY,
+    THINKING_PARAM_STYLE_CHAT_TEMPLATE_KWARGS,
+)
 
 
-def add_thinking_extra_body(
+def normalize_thinking_param_style(value: Any) -> str:
+    """校验思考开关的参数形态，未知形态直接报错而不是静默忽略。"""
+    style = str(value or THINKING_PARAM_STYLE_EXTRA_BODY).strip().lower()
+    if style not in THINKING_PARAM_STYLES:
+        raise ValueError(
+            "不支持的思考参数形态: "
+            f"{value}（可选: {', '.join(THINKING_PARAM_STYLES)}）"
+        )
+    return style
+
+
+def add_reasoning_control(
     request_params: Dict[str, Any],
-    enabled: bool,
-    send_param: bool = False,
+    api_mode: str = CHAT_COMPLETIONS_API_MODE,
+    *,
+    style: str = THINKING_PARAM_STYLE_EXTRA_BODY,
+    enabled: Optional[bool] = None,
+    effort: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """按需附加 enable_thinking 参数（部分网关需要显式声明）。"""
+    """按需附加思考开关与推理强度参数。
+
+    不同网关接受的形态不同：vLLM 类服务通常只认 chat_template_kwargs，
+    多数 OpenAI 兼容中转则只认 extra_body 顶层或 Responses API 的 reasoning。
+    """
     next_params = dict(request_params)
-    if not send_param:
+    style = normalize_thinking_param_style(style)
+
+    if api_mode == RESPONSES_API_MODE:
+        if effort:
+            next_params["reasoning"] = {"effort": str(effort)}
+        return next_params
+
+    if enabled is None and not effort:
         return next_params
 
     extra_body = dict(next_params.get("extra_body") or {})
-    extra_body["enable_thinking"] = bool(enabled)
-    next_params["extra_body"] = extra_body
+    if enabled is not None:
+        if style == THINKING_PARAM_STYLE_CHAT_TEMPLATE_KWARGS:
+            template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+            template_kwargs["enable_thinking"] = bool(enabled)
+            extra_body["chat_template_kwargs"] = template_kwargs
+        else:
+            extra_body["enable_thinking"] = bool(enabled)
+    if effort:
+        extra_body["reasoning_effort"] = str(effort)
+
+    if extra_body:
+        next_params["extra_body"] = extra_body
     return next_params
 
 
@@ -197,12 +249,9 @@ def remove_temperature_param(request_params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def is_thinking_unsupported_error(error: Exception) -> bool:
-    """识别模型或网关不支持 enable_thinking 参数的错误。"""
+    """识别模型或网关不支持思考开关/推理强度参数的错误。"""
     body = getattr(error, "body", None)
-    if isinstance(body, dict) and body.get("param") in (
-        "enable_thinking",
-        "extra_body.enable_thinking",
-    ):
+    if isinstance(body, dict) and body.get("param") in REASONING_CONTROL_PARAM_NAMES:
         return True
 
     message = str(error).lower()
@@ -215,12 +264,15 @@ def is_thinking_unsupported_error(error: Exception) -> bool:
 
 
 def remove_thinking_param(request_params: Dict[str, Any]) -> Dict[str, Any]:
-    """移除 enable_thinking 参数，适配不支持思考开关的模型网关。"""
+    """移除思考开关与推理强度参数，适配不支持这些参数的模型网关。"""
     next_params = dict(request_params)
+    next_params.pop("reasoning", None)
     extra_body = next_params.get("extra_body")
     if isinstance(extra_body, dict):
         cleaned = dict(extra_body)
         cleaned.pop("enable_thinking", None)
+        cleaned.pop("chat_template_kwargs", None)
+        cleaned.pop("reasoning_effort", None)
         if cleaned:
             next_params["extra_body"] = cleaned
         else:

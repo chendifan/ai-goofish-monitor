@@ -25,6 +25,8 @@ from src.config import (
     MODEL_NAME,
     ENABLE_RESPONSE_FORMAT,
     ENABLE_THINKING,
+    AI_THINKING_PARAM_STYLE,
+    AI_REASONING_EFFORT,
     client,
 )
 from src.ai_message_builder import (
@@ -46,6 +48,7 @@ from src.services.ai_request_compat import (
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
     is_thinking_unsupported_error,
+    normalize_thinking_param_style,
     remove_temperature_param,
     remove_thinking_param,
 )
@@ -382,7 +385,9 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
     api_mode = CHAT_COMPLETIONS_API_MODE
     use_response_format = ENABLE_RESPONSE_FORMAT
     use_temperature = True
-    use_thinking_param = ENABLE_THINKING
+    thinking_param_style = normalize_thinking_param_style(AI_THINKING_PARAM_STYLE)
+    reasoning_effort = str(AI_REASONING_EFFORT or "").strip()
+    use_reasoning_control = ENABLE_THINKING or bool(reasoning_effort)
     max_output_tokens = policy.base_output_tokens
 
     for attempt in policy.attempts():
@@ -403,8 +408,8 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
             if not use_temperature:
                 request_params = remove_temperature_param(request_params)
 
-            request_params = get_ai_request_params(**request_params)
-            if not use_thinking_param:
+            request_params = get_ai_request_params(api_mode=api_mode, **request_params)
+            if not use_reasoning_control:
                 request_params = remove_thinking_param(request_params)
 
             if AI_DEBUG_MODE:
@@ -463,10 +468,10 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
                 safe_print(
                     "   [AI分析] 当前模型不支持 temperature 参数，后续重试将自动禁用该参数。"
                 )
-            if use_thinking_param and is_thinking_unsupported_error(e):
-                use_thinking_param = False
+            if use_reasoning_control and is_thinking_unsupported_error(e):
+                use_reasoning_control = False
                 safe_print(
-                    "   [AI分析] 当前模型不支持 enable_thinking 参数，后续重试将自动移除该参数。"
+                    "   [AI分析] 当前模型不支持思考控制参数，后续重试将自动移除该参数。"
                 )
             if is_output_budget_error(e) and max_output_tokens < policy.output_token_cap:
                 escalated_tokens = policy.escalate_output_tokens(max_output_tokens)

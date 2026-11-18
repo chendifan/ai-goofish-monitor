@@ -8,6 +8,10 @@ from openai import AsyncOpenAI
 
 from src.infrastructure.config.settings import AISettings
 from src.infrastructure.external.ai_client import _sanitize_no_proxy_env
+from src.services.ai_request_compat import (
+    CHAT_COMPLETIONS_API_MODE,
+    add_reasoning_control,
+)
 
 # --- AI & Notification Configuration ---
 load_dotenv()
@@ -55,6 +59,8 @@ ENABLE_RESPONSE_FORMAT = os.getenv("ENABLE_RESPONSE_FORMAT", "true").lower() == 
 # AI 调用参数：超时、重试与输出预算（应用层是唯一重试主体，SDK 内部重试设为 0）。
 ai_settings = AISettings()
 AI_THINKING_ENABLED = ai_settings.thinking_enabled
+AI_THINKING_PARAM_STYLE = ai_settings.thinking_param_style
+AI_REASONING_EFFORT = ai_settings.reasoning_effort
 AI_REQUEST_TIMEOUT_SECONDS = ai_settings.request_timeout_seconds
 AI_CONNECT_TIMEOUT_SECONDS = ai_settings.connect_timeout_seconds
 AI_SDK_MAX_RETRIES = ai_settings.sdk_max_retries
@@ -105,12 +111,19 @@ if not client:
 if not all([BASE_URL, MODEL_NAME]) and 'prompt_generator.py' in sys.argv[0]:
     sys.exit("错误：请确保在 .env 文件中完整设置了 OPENAI_BASE_URL 和 OPENAI_MODEL_NAME。(OPENAI_API_KEY 对于某些服务是可选的)")
 
-def get_ai_request_params(**kwargs):
+def get_ai_request_params(*, api_mode: str = CHAT_COMPLETIONS_API_MODE, **kwargs):
     """
-    构建AI请求参数，根据ENABLE_THINKING和ENABLE_RESPONSE_FORMAT环境变量决定是否添加相应参数
+    构建AI请求参数，按 ENABLE_THINKING / AI_REASONING_EFFORT 附加思考控制参数，
+    并按网关认可的参数形态（AI_THINKING_PARAM_STYLE）写入请求。
     """
-    if ENABLE_THINKING:
-        kwargs["extra_body"] = {"enable_thinking": AI_THINKING_ENABLED}
+    if ENABLE_THINKING or AI_REASONING_EFFORT:
+        kwargs = add_reasoning_control(
+            kwargs,
+            api_mode,
+            style=AI_THINKING_PARAM_STYLE,
+            enabled=AI_THINKING_ENABLED if ENABLE_THINKING else None,
+            effort=AI_REASONING_EFFORT or None,
+        )
     
     # 如果禁用结构化输出，则移除 text.format 配置
     if not ENABLE_RESPONSE_FORMAT and "text" in kwargs:

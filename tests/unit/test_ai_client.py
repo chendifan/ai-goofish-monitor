@@ -17,6 +17,8 @@ def _fake_settings(**overrides):
         "enable_response_format": True,
         "enable_thinking": False,
         "thinking_enabled": False,
+        "thinking_param_style": "extra_body",
+        "reasoning_effort": "",
         "max_attempts": 4,
         "max_output_tokens": 20480,
         "max_output_tokens_cap": 32000,
@@ -451,3 +453,42 @@ def test_call_ai_omits_thinking_param_when_the_gate_is_closed():
     asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
 
     assert "extra_body" not in request_history[0]
+
+
+def test_call_ai_uses_configured_thinking_param_style():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings(
+        enable_thinking=True,
+        thinking_enabled=False,
+        thinking_param_style="chat_template_kwargs",
+    )
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        return SimpleNamespace(output_text='{"ok":true}')
+
+    client.client = _build_fake_client(fake_create)
+
+    asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert request_history[0]["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+
+
+def test_call_ai_sends_reasoning_effort_even_when_the_thinking_gate_is_closed():
+    client = AIClient.__new__(AIClient)
+    client.settings = _fake_settings(reasoning_effort="low")
+    request_history = []
+
+    async def fake_create(**kwargs):
+        request_history.append(kwargs)
+        return SimpleNamespace(output_text='{"ok":true}')
+
+    client.client = _build_fake_client(fake_create)
+
+    asyncio.run(client._call_ai([{"role": "user", "content": "hi"}]))
+
+    assert request_history[0]["extra_body"] == {"reasoning_effort": "low"}
+    assert "enable_thinking" not in request_history[0]["extra_body"]
