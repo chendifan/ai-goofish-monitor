@@ -92,3 +92,12 @@ def test_extract_ai_response_content_raises_when_content_and_reasoning_content_a
 
     with pytest.raises(EmptyAIResponseError):
         extract_ai_response_content(response)
+
+
+def test_truncation_message_reports_token_usage_for_sizing():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason="length")],
+        usage={"completion_tokens": 32000, "completion_tokens_details": {"reasoning_tokens": 31000}},
+    )
+    with pytest.raises(TruncatedAIResponseError, match="本次输出 32000 tokens"):
+        ensure_response_is_complete(response)

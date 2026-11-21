@@ -333,3 +333,58 @@ def test_attempt_counts_are_per_product_when_analyses_run_concurrently(
     for product_id in ("10", "11"):
         for attempt in (1, 2, 3):
             assert f"商品 #{product_id} 第 {attempt}/3 次尝试失败" in captured
+
+
+def test_get_ai_analysis_separates_cap_reached_from_bad_json(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS", "32000")
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS_CAP", "32000")
+
+    call_count = {"value": 0}
+    truncation = Exception(
+        "Error code: 502 - structured output was incomplete (finish_reason=length); "
+        "increase the output budget"
+    )
+    bad_json = Exception(
+        "Error code: 502 - model did not return valid JSON: Expecting ',' delimiter: "
+        "line 1 column 2018"
+    )
+    good_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        '{"prompt_version":"v1","is_recommended":true,'
+                        '"reason":"ok","risk_tags":[],'
+                        '"criteria_analysis":{"seller_type":"个人"}}'
+                    )
+                ),
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    async def fake_create(**_kwargs):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            raise truncation
+        if call_count["value"] == 2:
+            raise bad_json
+        return good_response
+
+    monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
+    monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+
+    result = asyncio.run(
+        ai_handler.get_ai_analysis(
+            {"商品信息": {"商品ID": "9", "商品标题": "测试商品9"}},
+            image_paths=[],
+            prompt_text="请输出 JSON",
+        )
+    )
+
+    assert result["reason"] == "ok"
+    captured = capsys.readouterr().out
+    assert "商品 #9 输出预算不足，已经在上限 32000 tokens" in captured
+    assert "商品 #9 JSON 校验失败" in captured
+    assert "商品 #9 第 3/4 次尝试成功" in captured

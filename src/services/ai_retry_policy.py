@@ -6,14 +6,22 @@ from typing import Optional
 from src.infrastructure.config.settings import AISettings
 
 OUTPUT_BUDGET_MARKERS = (
-    "structured_output_failed",
     "finish_reason=length",
+    "structured output was incomplete",
     "output budget",
     "output length",
-    "max_output_tokens",
-    "max_tokens",
     "truncat",
+    "incomplete",
 )
+STRUCTURED_OUTPUT_FORMAT_MARKERS = (
+    "did not return valid json",
+    "invalid json",
+    "invalid control character",
+    "expecting ',' delimiter",
+    "expecting value",
+)
+OUTPUT_BUDGET_ERROR_TYPES = {"max_tokens", "output_length_exceeded"}
+STRUCTURED_OUTPUT_FORMAT_TYPES = {"structured_output_failed", "invalid_json", "json_parse_error"}
 RATE_LIMIT_MARKERS = (
     "rate limit",
     "too many requests",
@@ -33,14 +41,36 @@ TRANSIENT_MESSAGE_MARKERS = (
 )
 
 
+def _error_type(error: Exception) -> str:
+    return str(getattr(error, "type", "") or "").lower()
+
+
 def is_output_budget_error(error: Exception) -> bool:
     """识别输出预算不足（思考过程或正文被截断）的错误。"""
     message = str(error).lower()
     if any(marker in message for marker in OUTPUT_BUDGET_MARKERS):
         return True
 
-    error_type = str(getattr(error, "type", "") or "").lower()
-    return error_type in {"structured_output_failed", "max_tokens", "output_length_exceeded"}
+    return _error_type(error) in OUTPUT_BUDGET_ERROR_TYPES
+
+
+def is_structured_output_format_error(error: Exception) -> bool:
+    """模型返回的 JSON 本身不合法（坏 JSON、空内容），加大预算解决不了这类问题。"""
+    if is_output_budget_error(error):
+        return False
+    message = str(error).lower()
+    if any(marker in message for marker in STRUCTURED_OUTPUT_FORMAT_MARKERS):
+        return True
+    return _error_type(error) in STRUCTURED_OUTPUT_FORMAT_TYPES
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """值得再试一次的情况，包括截断、坏 JSON 与瞬时故障。"""
+    return (
+        is_transient_error(error)
+        or is_output_budget_error(error)
+        or is_structured_output_format_error(error)
+    )
 
 
 def is_transient_error(error: Exception) -> bool:
@@ -89,8 +119,8 @@ class AIRetryPolicy:
     """AI 调用重试策略（应用层是唯一重试主体，SDK 内部重试应设为 0）。"""
 
     max_attempts: int = 4
-    base_output_tokens: int = 20480
-    output_token_cap: int = 32000
+    base_output_tokens: int = 32000
+    output_token_cap: int = 64000
     base_delay_seconds: float = 3.0
     delay_cap_seconds: float = 30.0
 

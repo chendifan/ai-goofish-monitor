@@ -4,6 +4,8 @@ from src.services.ai_retry_policy import (
     AIRetryPolicy,
     format_retry_note,
     is_output_budget_error,
+    is_retryable_error,
+    is_structured_output_format_error,
     is_transient_error,
     retry_after_seconds,
 )
@@ -80,3 +82,28 @@ def test_policy_reads_settings_from_env(monkeypatch):
     assert policy.max_attempts == 5
     assert policy.base_output_tokens == 6000
     assert policy.output_token_cap == 12000
+
+
+FORMAT_ERROR = Exception(
+    "Error code: 502 - model did not return valid JSON: Expecting ',' delimiter: "
+    "line 1 column 2018 (char 2017)"
+)
+
+
+def test_bad_json_error_is_not_reported_as_budget_shortfall():
+    assert is_structured_output_format_error(FORMAT_ERROR) is True
+    assert is_output_budget_error(FORMAT_ERROR) is False
+    assert is_structured_output_format_error(BUDGET_ERROR) is False
+
+
+def test_budget_and_format_errors_are_both_retryable():
+    assert is_retryable_error(BUDGET_ERROR) is True
+    assert is_retryable_error(FORMAT_ERROR) is True
+    assert is_retryable_error(Exception("Request timed out.")) is True
+    assert is_retryable_error(Exception("模型不支持该参数")) is False
+
+
+def test_default_policy_starts_at_32000_and_escalates_to_64000():
+    policy = AIRetryPolicy()
+    assert policy.base_output_tokens == 32000
+    assert policy.output_token_cap == 64000

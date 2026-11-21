@@ -42,8 +42,10 @@ from src.services.ai_retry_policy import (
     AIRetryPolicy,
     format_retry_note,
     is_output_budget_error,
-    is_transient_error,
+    is_retryable_error,
+    is_structured_output_format_error,
 )
+from src.services.image_type_detector import detect_image_mime
 
 
 def _normalize_no_proxy_host(part: str) -> str:
@@ -204,7 +206,9 @@ class AIClient:
         for path in image_paths:
             base64_img = self.encode_image(path)
             if base64_img:
-                image_data_urls.append(f"data:image/jpeg;base64,{base64_img}")
+                image_data_urls.append(
+                    f"data:{detect_image_mime(path)};base64,{base64_img}"
+                )
 
         text_prompt = build_analysis_text_prompt(
             product_json,
@@ -301,7 +305,11 @@ class AIClient:
                     if escalated_tokens > output_tokens:
                         output_tokens = escalated_tokens
                         print(f"{prefix}输出预算不足，下一次尝试将提高到 {output_tokens} tokens")
-                if is_transient_error(exc):
+                    else:
+                        print(f"{prefix}输出预算不足，已经在上限 {policy.output_token_cap} tokens")
+                elif is_structured_output_format_error(exc):
+                    print(f"{prefix}JSON 校验失败，输出预算保持 {output_tokens} tokens")
+                if is_retryable_error(exc):
                     retryable = True
 
                 print(f"{prefix}{policy.describe_attempt(attempt)}失败: {exc}")

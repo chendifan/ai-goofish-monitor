@@ -57,6 +57,7 @@ from src.services.ai_retry_policy import (
     AIRetryPolicy,
     format_retry_note,
     is_output_budget_error,
+    is_structured_output_format_error,
 )
 from src.services.image_type_detector import (
     MIN_IMAGE_BYTES,
@@ -506,13 +507,21 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
                 safe_print(
                     "   [AI分析] 当前模型不支持思考控制参数，后续重试将自动移除该参数。"
                 )
-            if is_output_budget_error(e) and max_output_tokens < policy.output_token_cap:
+            if is_output_budget_error(e):
                 escalated_tokens = policy.escalate_output_tokens(max_output_tokens)
                 if escalated_tokens > max_output_tokens:
                     max_output_tokens = escalated_tokens
                     safe_print(
                         f"   {log_scope} 输出预算不足，下一次尝试将提高到 {max_output_tokens} tokens"
                     )
+                else:
+                    safe_print(
+                        f"   {log_scope} 输出预算不足，已经在上限 {policy.output_token_cap} tokens"
+                    )
+            elif is_structured_output_format_error(e):
+                safe_print(
+                    f"   {log_scope} JSON 校验失败，输出预算保持 {max_output_tokens} tokens"
+                )
 
             if AI_DEBUG_MODE:
                 safe_print(f"\n--- [AI DEBUG] {log_scope} 第{attempt}次尝试 EXCEPTION ---")

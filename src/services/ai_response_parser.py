@@ -32,12 +32,36 @@ def get_finish_reason(response: Any) -> Optional[str]:
     return None
 
 
+def _usage_value(source: Any, key: str) -> Any:
+    if isinstance(source, dict):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
+def format_usage_summary(response: Any) -> str:
+    """把本次请求的 token 用量写成一行，用来判断预算是不是真的不够。"""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return ""
+    parts = []
+    completion = _usage_value(usage, "completion_tokens") or _usage_value(usage, "output_tokens")
+    if completion:
+        parts.append(f"本次输出 {completion} tokens")
+    details = _usage_value(usage, "completion_tokens_details") or _usage_value(usage, "output_tokens_details")
+    reasoning = _usage_value(details, "reasoning_tokens") if details else None
+    if reasoning:
+        parts.append(f"其中思考 {reasoning} tokens")
+    if not parts:
+        return ""
+    return f"（{'，'.join(parts)}）"
+
+
 def ensure_response_is_complete(response: Any) -> None:
     """响应被截断时抛出可重试的截断错误。"""
     finish_reason = get_finish_reason(response)
     if finish_reason in TRUNCATION_REASONS:
         raise TruncatedAIResponseError(
-            f"AI响应被截断（finish_reason={finish_reason}），输出预算不足。"
+            f"AI响应被截断（finish_reason={finish_reason}），输出预算不足。{format_usage_summary(response)}"
         )
 
 
