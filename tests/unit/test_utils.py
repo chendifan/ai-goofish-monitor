@@ -1,9 +1,16 @@
 import asyncio
+from types import SimpleNamespace
+
+import requests
 
 from src.services.result_storage_service import load_all_result_records
 from src.utils import (
+    describe_error_body,
+    error_status_code,
     format_registration_days,
     get_link_unique_key,
+    is_permanent_client_error,
+    retry_on_failure,
     safe_get,
     save_to_jsonl,
 )
@@ -52,3 +59,84 @@ def test_save_to_jsonl(tmp_path, monkeypatch):
         )
     )
     assert records == [record]
+
+
+def test_error_status_code_falls_back_to_response_for_requests_http_error():
+    response = SimpleNamespace(status_code=404, headers={}, content=b"")
+    error = requests.exceptions.HTTPError("404 Client Error", response=response)
+    assert error_status_code(error) == 404
+    assert is_permanent_client_error(error) is True
+
+
+def test_permanent_client_error_keeps_retryable_status_codes():
+    gateways = [429, 502, 504]
+    for code in gateways:
+        error = requests.exceptions.HTTPError(
+            f"{code} error",
+            response=SimpleNamespace(status_code=code, headers={}, content=b""),
+        )
+        assert is_permanent_client_error(error) is False
+
+
+def test_describe_error_body_skips_binary_responses():
+    response = SimpleNamespace(
+        status_code=404,
+        headers={"Content-Type": "image/gif"},
+        content=b"GIF89a\x01\x00\x01\x00",
+        text="binary decoded as text",
+    )
+    note = describe_error_body(response)
+    assert "image/gif" in note
+    assert "binary decoded as text" not in note
+
+
+def test_retry_on_failure_stops_on_permanent_client_error(capsys):
+    calls = []
+    response = SimpleNamespace(
+        status_code=404,
+        headers={"Content-Type": "image/gif"},
+        content=b"GIF89a placeholder",
+        text="GIF89a placeholder",
+    )
+    error = requests.exceptions.HTTPError("404 Client Error", response=response)
+
+    @retry_on_failure(retries=3, delay=0)
+    async def download():
+        calls.append(1)
+        raise error
+
+    assert asyncio.run(download()) is None
+    assert len(calls) == 1
+    captured = capsys.readouterr().out
+    assert "Status Code): 404" in captured
+    assert "GIF89a placeholder" not in captured
+
+
+def test_retry_on_failure_still_retries_server_errors():
+    calls = []
+
+    @retry_on_failure(retries=2, delay=0)
+    async def download():
+        calls.append(1)
+        raise requests.exceptions.HTTPError(
+            "502 error",
+            response=SimpleNamespace(
+                status_code=502,
+                headers={"Content-Type": "text/plain"},
+                content=b"bad gateway",
+                text="bad gateway",
+            ),
+        )
+
+    assert asyncio.run(download()) is None
+    assert len(calls) == 2
+
+
+def test_describe_error_body_uses_content_length_when_body_is_closed():
+    response = SimpleNamespace(
+        status_code=404,
+        headers={"Content-Type": "image/gif", "Content-Length": "49"},
+        content=b"",
+        text="",
+    )
+    assert "49 字节" in describe_error_body(response)

@@ -8,11 +8,46 @@ import glob
 from datetime import datetime
 from functools import wraps
 from urllib.parse import quote
+from typing import Optional
 
 from openai import APIStatusError
 from requests.exceptions import HTTPError
 
 from src.services.result_storage_service import save_result_record
+
+
+def error_status_code(error) -> Optional[int]:
+    """requests 的 HTTPError 没有 status_code 属性，状态码要从 response 上取。"""
+    code = getattr(error, "status_code", None)
+    if code is None:
+        code = getattr(getattr(error, "response", None), "status_code", None)
+    if code is None:
+        return None
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_permanent_client_error(error) -> bool:
+    """4xx 里除 408 和 429 之外重试没有意义。"""
+    code = error_status_code(error)
+    return code is not None and 400 <= code < 500 and code not in {408, 429}
+
+
+def describe_error_body(response) -> str:
+    """文本类响应才写进日志，图片之类的二进制内容只记录类型和大小。"""
+    if response is None:
+        return ""
+    headers = getattr(response, "headers", None) or {}
+    content_type = str(headers.get("Content-Type", "")).split(";")[0]
+    body = getattr(response, "content", b"") or b""
+    if content_type.startswith("text/") or content_type in {"application/json", "application/problem+json"}:
+        text = response.text[:300]
+        suffix = "..." if len(response.text) > 300 else ""
+        return f"响应内容 ({content_type}): {text}{suffix}"
+    size = len(body) or int(headers.get("Content-Length") or 0)
+    return f"响应类型 {content_type or '未知'}，二进制内容 {size} 字节未写入日志"
 
 
 def retry_on_failure(retries=3, delay=5):
@@ -27,12 +62,15 @@ def retry_on_failure(retries=3, delay=5):
                     return await func(*args, **kwargs)
                 except (APIStatusError, HTTPError) as e:
                     print(f"函数 {func.__name__} 第 {i + 1}/{retries} 次尝试失败，发生HTTP错误。")
-                    if hasattr(e, 'status_code'):
-                        print(f"  - 状态码 (Status Code): {e.status_code}")
-                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                        response_text = e.response.text
-                        print(
-                            f"  - 返回值 (Response): {response_text[:300]}{'...' if len(response_text) > 300 else ''}")
+                    status_code = error_status_code(e)
+                    if status_code is not None:
+                        print(f"  - 状态码 (Status Code): {status_code}")
+                    body_note = describe_error_body(getattr(e, "response", None))
+                    if body_note:
+                        print(f"  - {body_note}")
+                    if is_permanent_client_error(e):
+                        print("  - 客户端错误，重试没有意义，直接放弃。")
+                        return None
                 except json.JSONDecodeError as e:
                     print(f"函数 {func.__name__} 第 {i + 1}/{retries} 次尝试失败: JSON解析错误 - {e}")
                 except Exception as e:

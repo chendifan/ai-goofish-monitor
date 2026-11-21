@@ -58,6 +58,11 @@ from src.services.ai_retry_policy import (
     format_retry_note,
     is_output_budget_error,
 )
+from src.services.image_type_detector import (
+    MIN_IMAGE_BYTES,
+    detect_image_mime,
+    is_placeholder_image,
+)
 from src.utils import convert_goofish_link, retry_on_failure
 
 
@@ -126,17 +131,41 @@ def _extract_message_content_types(message: dict) -> list[str]:
 
 @retry_on_failure(retries=2, delay=3)
 async def _download_single_image(url, save_path):
-    """一个带重试的内部函数，用于异步下载单个图片。"""
+    """下载单个图片，校验内容类型与文件头，写临时文件后原子替换。"""
     loop = asyncio.get_running_loop()
     # 使用 run_in_executor 运行同步的 requests 代码，避免阻塞事件循环
     response = await loop.run_in_executor(
         None,
         lambda: requests.get(url, headers=IMAGE_DOWNLOAD_HEADERS, timeout=20, stream=True)
     )
-    response.raise_for_status()
-    with open(save_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    try:
+        response.raise_for_status()
+        content_type = str(response.headers.get("Content-Type", "")).split(";")[0]
+        head = next(response.iter_content(chunk_size=1024), b"")
+        if not content_type.startswith("image/"):
+            safe_print(
+                f"   [图片] 响应不是图片，跳过下载: {url} "
+                f"(Content-Type: {content_type or '未知'}, {len(head)} 字节)"
+            )
+            return None
+        if is_placeholder_image(head):
+            safe_print(f"   [图片] 收到 1x1 占位图，跳过下载: {url}")
+            return None
+
+        part_path = f"{save_path}.part"
+        written = len(head)
+        with open(part_path, 'wb') as f:
+            f.write(head)
+            for chunk in response.iter_content(chunk_size=8192):
+                written += len(chunk)
+                f.write(chunk)
+        if written < MIN_IMAGE_BYTES:
+            os.remove(part_path)
+            safe_print(f"   [图片] 图片过小（{written} 字节），跳过: {url}")
+            return None
+        os.replace(part_path, save_path)
+    finally:
+        response.close()
     return save_path
 
 
@@ -195,12 +224,14 @@ async def download_all_images(product_id, image_urls, task_name="default", concu
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     saved_paths = []
-    for url, result in zip(urls, results):
+    for index, (url, result) in enumerate(zip(urls, results), start=1):
         try:
             if isinstance(result, Exception):
                 raise result
             if result:
                 saved_paths.append(result)
+            else:
+                safe_print(f"   [图片] 图片 {index}/{total_images} 未能保存: {url}")
         except Exception as e:
             safe_print(f"   [图片] 处理图片 {url} 时发生错误，已跳过此图: {e}")
 
@@ -338,7 +369,9 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
         for path in image_paths:
             base64_image = encode_image_to_base64(path)
             if base64_image:
-                image_data_urls.append(f"data:image/jpeg;base64,{base64_image}")
+                image_data_urls.append(
+                    f"data:{detect_image_mime(path)};base64,{base64_image}"
+                )
 
     combined_text_prompt = build_analysis_text_prompt(
         product_details_json,

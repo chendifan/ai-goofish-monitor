@@ -134,6 +134,10 @@ class ItemAnalysisDispatcher:
                 )
             ai_result.setdefault("analysis_source", "ai")
             ai_result.setdefault("keyword_hit_count", 0)
+            image_urls = (record.get("商品信息", {}) or {}).get("商品图片列表", [])
+            missing_count = len(image_urls) - len(image_paths)
+            if job.analyze_images and missing_count > 0:
+                ai_result["image_missing_count"] = missing_count
             return ai_result
         except Exception as exc:
             return self._build_ai_error_result(
